@@ -30,7 +30,7 @@ import Metrics
 VOC_ROOT            =  "C:\\data\\VOCdevkit\\VOC2012"             #"./data/fss-data/VOCdevkit/VOC2012" C:\data\sbd\benchmark_RELEASE/dataset
 SBD_ROOT            =  "C:\\data\\sbd\\benchmark_RELEASE\\dataset"   
 NUM_FOLDS           = 4  # ← Run all 4 folds
-K_SHOT              = 1
+K_SHOT              = 5
 BACKBONE_NAME       = "resnet50"
 DECODER_CHANNELS    = 256   # FPN output channels — 256 is standard
 BATCH_SIZE          = 8
