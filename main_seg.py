@@ -28,7 +28,7 @@ import Metrics
 # Config
 # ─────────────────────────────────────────────────────────────────
 VOC_ROOT            =  "./data/fss-data/VOCdevkit/VOC2012" #"C:\\data\\VOCdevkit\\VOC2012"             #"./data/fss-data/VOCdevkit/VOC2012" C:\data\sbd\benchmark_RELEASE/dataset
-SBD_ROOT            =  "./data/fss-data/sbd/benchmark_RELEASE/dataset"#"C:\\data\\sbd\\benchmark_RELEASE\\dataset"   
+SBD_ROOT            =  "./data/fss-data/sbd"#"C:\\data\\sbd\\benchmark_RELEASE\\dataset"   
 NUM_FOLDS           = 4  # ← Run all 4 folds
 K_SHOT              = 5
 BACKBONE_NAME       = "resnet50"
