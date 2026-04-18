@@ -77,7 +77,7 @@ VOC_CLASS_NAMES = [
     "motorbike", "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor"
 ]
 
-IMG_SIZE = 224
+IMG_SIZE = 473
 
 # ─────────────────────────────────────────────────────────────────
 # Shared helpers
