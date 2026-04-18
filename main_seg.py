@@ -37,7 +37,7 @@ BATCH_SIZE          = 8
 NUM_EPOCHS          = 10
 LEARNING_RATE       = 0.001
 DECODER_LR          = 0.001   # can set higher e.g. 0.005 since decoder is random init
-IMG_SIZE            = 224
+IMG_SIZE            = 473 #224
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device} | Backbone: {BACKBONE_NAME} | {K_SHOT}-shot")
