@@ -1,5 +1,5 @@
 """
-main.py  —  FSS with FPN Decoder (updated version)
+main_seg.py  —  FSS with FPN Decoder (updated version)
 ====================================================
 CHANGES from the no-decoder version:
   1. load_backbone() now returns feat_dims dict instead of single int
@@ -9,7 +9,12 @@ CHANGES from the no-decoder version:
   5. Phase 2: we pass images through backbone+decoder to get fused features
      for novel prototype extraction (not just raw backbone features)
 
-Everything else — 3-phase structure, loss, memory update, metrics — unchanged.
+VISUALIZATION ADDITIONS (v2):
+  - Visualizer.py is imported; plots are saved to plots/fold_N/
+  - phase1_train now tracks val_losses, train_mious, lr_history
+  - phase1_validate now returns (val_loss, val_miou, val_acc)
+  - phase3_test now saves per-class IoU, pixel acc, and sample images/masks
+  - After all folds: cross-fold summary bar chart is produced
 """
 
 import torch
@@ -23,12 +28,13 @@ import Data_Loader
 import Models
 import APM
 import Metrics
+import Visualizer          # ← NEW: visualization module
 
 # ─────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────
-VOC_ROOT            =  "./data/fss-data/VOCdevkit/VOC2012" #"C:\\data\\VOCdevkit\\VOC2012"             #"./data/fss-data/VOCdevkit/VOC2012" C:\data\sbd\benchmark_RELEASE/dataset
-SBD_ROOT            =  "./data/fss-data/sbd/benchmark_RELEASE/dataset"#"C:\\data\\sbd\\benchmark_RELEASE\\dataset"   
+VOC_ROOT            =  "./data/fss-data/VOCdevkit/VOC2012"
+SBD_ROOT            =  "./data/fss-data/sbd/benchmark_RELEASE/dataset"
 NUM_FOLDS           = 4  # ← Run all 4 folds
 K_SHOT              = 5
 BACKBONE_NAME       = "resnet50"
@@ -37,20 +43,23 @@ BATCH_SIZE          = 8
 NUM_EPOCHS          = 10
 LEARNING_RATE       = 0.001
 DECODER_LR          = 0.001   # can set higher e.g. 0.005 since decoder is random init
-IMG_SIZE            = 473 #224
+IMG_SIZE            = 473
+
+# Number of query-image samples to save per fold for visual inspection
+N_VIS_SAMPLES       = 6    # ← NEW: how many segmentation samples to plot
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device} | Backbone: {BACKBONE_NAME} | {K_SHOT}-shot")
 print(f"Decoder: FPN, out_channels={DECODER_CHANNELS}")
 print(f"Running {NUM_FOLDS} folds...")
 
-# ─────────────────────────────────────────────────────────────────
-# Data — Will be loaded per-fold in the main loop
-# ─────────────────────────────────────────────────────────────────
-# (Moved inside the fold loop below)
-
 # Global loss criterion (used in compute_batch_loss)
 criterion = nn.CrossEntropyLoss(ignore_index=255)
+
+# ─────────────────────────────────────────────────────────────────
+# NOTE: 'fold' is now passed explicitly to phase functions so that
+# Visualizer can save into the correct fold sub-directory.
+# ─────────────────────────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -59,8 +68,6 @@ criterion = nn.CrossEntropyLoss(ignore_index=255)
 def compute_batch_loss(model, images, masks, class_labels, novel_cls_id=None):
     logits, fused = model(images, novel_cls_id)   # [B, S, 56, 56]
 
-    # Upsample from 56×56 → 224×224
-    # (previously was 7×7 → 224×224, now 56×56 → 224×224 = much less stretching)
     logits_full = F.interpolate(
         logits, size=(IMG_SIZE, IMG_SIZE),
         mode="bilinear", align_corners=False
@@ -74,7 +81,6 @@ def compute_batch_loss(model, images, masks, class_labels, novel_cls_id=None):
         if novel_cls_id is None:
              cls_idx  = class_labels[i].item()
              fg_slot  = cls_idx + 1
-             # FIX 1: use class-specific bg slot instead of global slot 0
              bg_slot  = model.memory_module._bg_slot(cls_idx)
              logits_i = torch.stack(
                 [logits_full[i, bg_slot], logits_full[i, fg_slot]], dim=0
@@ -92,13 +98,20 @@ def compute_batch_loss(model, images, masks, class_labels, novel_cls_id=None):
 # ─────────────────────────────────────────────────────────────────
 # PHASE 1 — Train on base classes
 # ─────────────────────────────────────────────────────────────────
-def phase1_train():
+def phase1_train(fold):                            # ← CHANGED: added 'fold' param
     print("\n" + "="*60)
     print("  PHASE 1 — Learning on BASE classes (with FPN decoder)")
     print("="*60)
 
     best_val_miou = 0.0
-    train_losses, val_mious = [], []
+
+    # ── NEW: initialise per-epoch history lists ──────────────────
+    train_losses = []
+    val_losses   = []
+    train_mious  = []
+    val_mious    = []
+    lr_history   = []         # backbone LR per epoch
+    # ────────────────────────────────────────────────────────────
 
     for epoch in range(NUM_EPOCHS):
         model.train()
@@ -112,13 +125,8 @@ def phase1_train():
             optimizer.zero_grad()
             loss, preds, fused = compute_batch_loss(model, images, masks, labels)
             loss.backward()
-            # Gradients flow through: loss → logits → decoder → layer4
-            # layer1/2/3 are frozen so gradients stop there
             optimizer.step()
 
-            # Memory update — uses the DECODER OUTPUT (fused 256-dim features)
-            # NOT the raw backbone features. This is important:
-            # prototypes are built in the same feature space the decoder produces.
             with torch.no_grad():
                 model.memory_module.update_from_batch(
                     fused.detach(), masks, labels.tolist()
@@ -134,11 +142,18 @@ def phase1_train():
                       f"Batch {batch_idx}/{len(train_loader)} | "
                       f"Loss {loss.item():.4f}")
 
-        _, val_miou, val_acc = phase1_validate()
-        _, train_miou, _     = metrics.compute()
-        avg_loss = epoch_loss / len(train_loader)
+        # ── CHANGED: phase1_validate now also returns val_loss ───
+        val_loss, val_miou, val_acc = phase1_validate()
+        _, train_miou, _            = metrics.compute()
+        avg_loss                    = epoch_loss / len(train_loader)
+
+        # ── NEW: append to history ───────────────────────────────
         train_losses.append(avg_loss)
-        val_mious.append(val_miou)
+        val_losses.append(val_loss)
+        train_mious.append(float(train_miou))
+        val_mious.append(float(val_miou))
+        lr_history.append(optimizer.param_groups[0]["lr"])
+        # ────────────────────────────────────────────────────────
 
         lrs = [g["lr"] for g in optimizer.param_groups]
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} | "
@@ -154,10 +169,26 @@ def phase1_train():
         scheduler.step()
 
     print(f"\n[Phase 1] Best val mIoU = {best_val_miou*100:.2f}%")
+
+    # ── NEW: plot training curves for this fold ──────────────────
+    Visualizer.plot_training_curves(
+        fold        = fold,
+        train_losses= train_losses,
+        val_losses  = val_losses,
+        train_mious = train_mious,
+        val_mious   = val_mious,
+        lr_history  = lr_history,
+    )
+    # ────────────────────────────────────────────────────────────
+
     return best_val_miou
 
 
 def phase1_validate():
+    """
+    CHANGED: now returns (val_loss, val_miou, val_acc) — added val_loss
+    so it can be recorded for the training-curve plot.
+    """
     model.eval()
     metrics    = Metrics.SegMetrics(num_classes=2)
     total_loss = 0.0
@@ -171,11 +202,13 @@ def phase1_validate():
             for i in range(images.shape[0]):
                 metrics.update(preds[i].unsqueeze(0), masks[i].unsqueeze(0))
 
-    return total_loss / len(val_loader), *metrics.compute()[1:]
+    val_loss = total_loss / len(val_loader)          # ← NEW: compute mean val loss
+    _, miou, acc = metrics.compute()
+    return val_loss, miou, acc                        # ← CHANGED: returns 3 values
 
 
 # ─────────────────────────────────────────────────────────────────
-# PHASE 2 — Adapt to novel classes
+# PHASE 2 — Adapt to novel classes  (unchanged)
 # ─────────────────────────────────────────────────────────────────
 def phase2_adapt(novel_dataset, novel_classes, k_shot):
     print("\n" + "="*60)
@@ -204,16 +237,11 @@ def phase2_adapt(novel_dataset, novel_classes, k_shot):
         with torch.no_grad():
             for img, msk in support:
                 img_t = img.unsqueeze(0).to(device)
-
-                # CHANGED: run through backbone AND decoder to get 256-dim features
-                # (same feature space the prototypes were built in during Phase 1)
                 feat2, feat3, feat4 = model.backbone(img_t)
-                fused = model.decoder(feat2, feat3, feat4)  # [1, 256, 56, 56]
-
+                fused = model.decoder(feat2, feat3, feat4)
                 support_feats.append(fused)
                 support_masks_list.append(msk.unsqueeze(0).to(device))
 
-        # Build novel prototype in the 256-dim decoder feature space
         model.memory_module.build_novel_prototype(
             support_feats, support_masks_list, cls_id
         )
@@ -225,13 +253,20 @@ def phase2_adapt(novel_dataset, novel_classes, k_shot):
 # ─────────────────────────────────────────────────────────────────
 # PHASE 3 — Test on novel classes
 # ─────────────────────────────────────────────────────────────────
-def phase3_test(novel_classes, query_data):
+def phase3_test(fold, novel_classes, query_data):     # ← CHANGED: added 'fold'
     print("\n" + "="*60)
     print("  PHASE 3 — Testing on NOVEL classes (with FPN decoder)")
     print("="*60)
 
     model.eval()
     all_mious = []
+
+    # ── NEW: containers for visualization ───────────────────────
+    per_class_ious  = []
+    per_class_accs  = []
+    class_name_list = []
+    vis_samples     = []    # dicts: {image, gt_mask, pred_mask, class_name, iou}
+    # ────────────────────────────────────────────────────────────
 
     with torch.no_grad():
         for cls_id in novel_classes:
@@ -253,12 +288,64 @@ def phase3_test(novel_classes, query_data):
 
             _, cls_miou, cls_acc = metrics.compute()
             all_mious.append(cls_miou)
+
+            # ── NEW: record for plots ────────────────────────────
+            per_class_ious.append(float(cls_miou))
+            per_class_accs.append(float(cls_acc))
+            class_name_list.append(cls_name)
+            # ────────────────────────────────────────────────────
+
             print(f"  {cls_name:15s} (class {cls_id:2d}) | "
                   f"mIoU={cls_miou*100:.2f}%  PixAcc={cls_acc*100:.2f}%  "
                   f"({len(queries)} query images)")
 
+            # ── NEW: collect segmentation samples ────────────────
+            if len(vis_samples) < N_VIS_SAMPLES:
+                for q_img, q_mask in queries:
+                    if len(vis_samples) >= N_VIS_SAMPLES:
+                        break
+                    img_t  = q_img.unsqueeze(0).to(device)
+                    mask_t = q_mask.unsqueeze(0).to(device)
+
+                    logits, _ = model(img_t, novel_cls_id=cls_id)
+                    logits_full = F.interpolate(
+                        logits, size=(IMG_SIZE, IMG_SIZE),
+                        mode="bilinear", align_corners=False
+                    )
+                    pred_mask = logits_full.argmax(dim=1).squeeze(0)
+
+                    # quick per-sample IoU for the subplot title
+                    from Metrics import SegMetrics
+                    sm = SegMetrics(num_classes=2)
+                    sm.update(pred_mask.unsqueeze(0), q_mask.unsqueeze(0))
+                    _, sample_iou, _ = sm.compute()
+
+                    vis_samples.append({
+                        "image"     : q_img,
+                        "gt_mask"   : q_mask,
+                        "pred_mask" : pred_mask.cpu(),
+                        "class_name": cls_name,
+                        "iou"       : float(sample_iou),
+                    })
+            # ────────────────────────────────────────────────────
+
     mean_novel_miou = sum(all_mious) / len(all_mious)
     print(f"\n[Phase 3] Mean novel mIoU = {mean_novel_miou*100:.2f}%")
+
+    # ── NEW: save Phase 3 plots ──────────────────────────────────
+    Visualizer.plot_per_class_iou(
+        fold           = fold,
+        class_names    = class_name_list,
+        per_class_ious = per_class_ious,
+        per_class_accs = per_class_accs,
+    )
+    Visualizer.plot_segmentation_samples(
+        fold      = fold,
+        samples   = vis_samples,
+        n_samples = N_VIS_SAMPLES,
+    )
+    # ────────────────────────────────────────────────────────────
+
     return mean_novel_miou
 
 
@@ -275,7 +362,7 @@ if __name__ == "__main__":
 
         # Reload data for this fold
         train_loader, val_loader, NUM_BASE = Data_Loader.prepare_base_loaders(
-            voc_root=VOC_ROOT,sbd_root=SBD_ROOT, fold=fold, batch_size=BATCH_SIZE
+            voc_root=VOC_ROOT, sbd_root=SBD_ROOT, fold=fold, batch_size=BATCH_SIZE
         )
         novel_dataset, novel_classes = Data_Loader.prepare_novel_dataset(
             voc_root=VOC_ROOT, fold=fold
@@ -305,13 +392,14 @@ if __name__ == "__main__":
 
         scheduler = StepLR(optimizer, step_size=1, gamma=0.30)
 
-        # Run phases for this fold
-        phase1_val_miou = phase1_train()
+        # ── CHANGED: pass fold to phase functions ────────────────
+        phase1_val_miou = phase1_train(fold)                            # ← pass fold
         query_data      = phase2_adapt(novel_dataset, novel_classes, K_SHOT)
-        novel_miou      = phase3_test(novel_classes, query_data)
+        novel_miou      = phase3_test(fold, novel_classes, query_data)  # ← pass fold
+        # ────────────────────────────────────────────────────────
 
         result = {
-            "fold": fold,
+            "fold"       : fold,
             "phase1_miou": phase1_val_miou,
             "phase3_miou": novel_miou
         }
@@ -330,8 +418,13 @@ if __name__ == "__main__":
     print(f"{'='*60}")
     for res in fold_results:
         print(f"  Fold {res['fold']} | Phase1={res['phase1_miou']*100:.2f}% | Phase3={res['phase3_miou']*100:.2f}%")
-    
+
     avg_phase1 = sum(r['phase1_miou'] for r in fold_results) / len(fold_results)
     avg_phase3 = sum(r['phase3_miou'] for r in fold_results) / len(fold_results)
     print(f"\n  Average Phase 1 mIoU (base)  = {avg_phase1*100:.2f}%")
     print(f"  Average Phase 3 mIoU (novel) = {avg_phase3*100:.2f}%")
+
+    # ── NEW: cross-fold summary plot (runs once, after all folds) ──
+    Visualizer.plot_fold_summary(fold_results)
+    # ──────────────────────────────────────────────────────────────
+    print(f"\n[Visualizer] All plots saved to ./plots/")
